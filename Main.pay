@@ -1,0 +1,125 @@
+import os
+import sqlite3
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+
+# ডাটাবেজ সেটআপ
+conn = sqlite3.connect("bot_data.db", check_same_thread=False)
+cursor = conn.cursor()
+cursor.execute(
+    """CREATE TABLE IF NOT EXISTS users 
+                  (user_id INTEGER PRIMARY KEY, balance REAL DEFAULT 0)"""
+)
+conn.commit()
+
+# /start কমান্ড
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    cursor.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
+    conn.commit()
+
+    keyboard = [
+        [InlineKeyboardButton("💳 Add Balance", callback_data="add_balance")],
+        [InlineKeyboardButton("👤 My Profile", callback_data="my_profile")],
+        [InlineKeyboardButton("💎 Buy Diamond", callback_data="buy_diamond")],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await update.message.reply_text(
+        f"👋 হে {update.effective_user.first_name}!\nফ্রি ফায়ার টপআপ বটে স্বাগতম। নিচের যেকোনো অপশন বেছে নিন:",
+        reply_markup=reply_markup,
+    )
+
+# বাটন হ্যান্ডলার
+async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+
+    if query.data == "add_balance":
+        msg = (
+            "📌 **টাকা পাঠানোর নিয়ম:**\n\n"
+            "বিকাশ/পার্সোনাল: **01922093718**\n\n"
+            "নগদ/পার্সোনাল: **01881649592**\n\n"
+            "টাকা পাঠানোর পর শুধু **TrxID** (ট্রানজেকশন আইডি) লিখে রিপ্লাই মেসেজ দিন।"
+	 )
+        context.user_data["state"] = "WAITING_FOR_TRX"
+        await query.message.reply_text(msg, parse_mode="Markdown")
+
+    elif query.data == "my_profile":
+        cursor.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,))
+        row = cursor.fetchone()
+        balance = row[0] if row else 0
+        await query.message.reply_text(f"👤 আপনার আইডি: `{user_id}`\n💰 বর্তমান ব্যালেন্স: {balance} টাকা", parse_mode="Markdown")
+
+    elif query.data == "buy_diamond":
+        await query.message.reply_text("💎 টপআপ সার্ভিস খুব শীঘ্রই চালু হচ্ছে!")
+
+# মেসেজ হ্যান্ডলার (TrxID গ্রহণ)
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    state = context.user_data.get("state")
+
+    if state == "WAITING_FOR_TRX":
+        trx_id = update.message.text.strip()
+        context.user_data["state"] = None
+
+        await update.message.reply_text("✅ আপনার TrxID এডমিনের কাছে পাঠানো হয়েছে। যাচাই করে ব্যালেন্স যোগ করা হবে।")
+
+        # এডমিনকে নোটিফিকেশন পাঠানো
+        keyboard = [
+            [
+                InlineKeyboardButton("Approve 50Tk", callback_data=f"app_{user_id}_50"),
+                InlineKeyboardButton("Approve 100Tk", callback_data=f"app_{user_id}_100"),
+            ],
+            [InlineKeyboardButton("❌ Reject", callback_data=f"rej_{user_id}")],
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        await context.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=f"🔔 **নতুন ব্যালেন্স রিকোয়েস্ট!**\n\nইউজার: {update.effective_user.mention_html()}\nID: `{user_id}`\nTrxID: `{trx_id}`",
+            parse_mode="HTML",
+            reply_markup=reply_markup,
+        )
+
+# এডমিন অনুমোদন হ্যান্ডলার
+async def admin_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data.split("_")
+    action = data[0]
+    target_user_id = int(data[1])
+
+    if action == "app":
+        amount = float(data[2])
+        cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (amount, target_user_id))
+        conn.commit()
+
+        await query.edit_message_text(f"✅ User `{target_user_id}` এর একাউন্টে {amount} টাকা এড করা হয়েছে।")
+        await context.bot.send_message(chat_id=target_user_id, text=f"🎉 আপনার একাউন্টে {amount} টাকা এড করা হয়েছে!")
+
+    elif action == "rej":
+        await query.edit_message_text(f"❌ User `{target_user_id}` এর রিকোয়েস্ট বাতিল করা হয়েছে।")
+        await context.bot.send_message(chat_id=target_user_id, text="❌ আপনার পেমেন্ট রিকোয়েস্টটি বাতিল করা হয়েছে।")
+
+if __name__ == "__main__":
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(admin_action, pattern="^(app|rej)_"))
+    app.add_handler(CallbackQueryHandler(button_click))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    print("Bot is running...")
+    app.run_polling()
